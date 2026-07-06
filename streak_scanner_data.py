@@ -9,6 +9,7 @@ import os
 import gzip
 import csv
 import io
+import re
 
 # --- Page Config ---
 st.set_page_config(page_title="Upstox Swing Analyzer", page_icon="📈", layout="wide")
@@ -177,8 +178,13 @@ def get_closest_expiry(symbol, trade_date_str, token):
     return valid_dates[0] if valid_dates else None
 
 def resolve_contract(symbol, expiry_date_str, strike, option_type, token):
+    """Upgraded to find the closest available strike if exact match doesn't exist."""
     expiry_date = datetime.strptime(expiry_date_str, "%Y-%m-%d").date()
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
+    target_strike = float(strike)
+    
+    closest_key = None
+    min_diff = float('inf')
     
     if expiry_date < datetime.today().date():
         url = "https://api.upstox.com/v2/expired-instruments/option/contract"
@@ -187,13 +193,18 @@ def resolve_contract(symbol, expiry_date_str, strike, option_type, token):
         if res and res.status_code == 200 and res.json().get("status") == "success":
             for contract in res.json().get("data", []):
                 tsym = contract.get("trading_symbol", "").upper()
-                if symbol in tsym and option_type in tsym and str(int(float(strike))) in tsym:
-                    return contract.get("instrument_key")
+                if symbol in tsym and option_type in tsym:
+                    match = re.search(r'(\d+)(CE|PE)$', tsym)
+                    if match:
+                        c_strike = float(match.group(1))
+                        diff = abs(c_strike - target_strike)
+                        if diff < min_diff:
+                            min_diff = diff
+                            closest_key = contract.get("instrument_key")
     else:
         url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
         res = requests.get(url)
         if res.status_code == 200:
-            target_strike = float(strike)
             with gzip.open(io.BytesIO(res.content), 'rt', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
@@ -201,9 +212,12 @@ def resolve_contract(symbol, expiry_date_str, strike, option_type, token):
                     if symbol in tsym and row.get('expiry') == expiry_date_str and option_type in tsym:
                         try: row_strike = float(row.get('strike', 0))
                         except: row_strike = 0.0
-                        if row_strike == target_strike:
-                            return row.get('instrument_key')
-    return None
+                        diff = abs(row_strike - target_strike)
+                        if diff < min_diff:
+                            min_diff = diff
+                            closest_key = row.get('instrument_key')
+                            
+    return closest_key
 
 def get_specific_candle(instrument_key, target_date, target_time, token):
     encoded_key = urllib.parse.quote(instrument_key)
@@ -230,10 +244,8 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
     category = "Liquid" if symbol_clean in liquid_symbols else "Others"
     ce_pe = "PE" if is_short else "CE"
     
-    # Check lot size availability
     has_lot_size = symbol_clean in lot_sizes_dict
-    lot_size = lot_sizes_dict.get(symbol_clean, 1) # Default to 1 if not found
-    
+    lot_size = lot_sizes_dict.get(symbol_clean, 1) 
     instrument_key = get_instrument_key(symbol_clean, token)
     
     result = {
@@ -379,11 +391,20 @@ def update_options_in_ledger(token):
                         
                         if opt_entry is not None:
                             exit_dt_str = str(row.get('Exit Time'))
+                            opt_exit = None
+                            
                             if pd.notna(row.get('Exit Time')) and exit_dt_str != 'None':
                                 opt_exit = get_specific_candle(opt_key, exit_dt_str[:10], exit_dt_str[11:16], token)
                             else:
                                 now = datetime.now()
                                 opt_exit = get_specific_candle(opt_key, now.strftime("%Y-%m-%d"), now.strftime("%H:%M"), token)
+                                
+                                # FALLBACK: If weekend or after hours, get last available close
+                                if opt_exit is None:
+                                    past_date = (now - timedelta(days=5)).strftime("%Y-%m-%d")
+                                    past_candles = fetch_all_candles(opt_key, past_date, token)
+                                    if past_candles:
+                                        opt_exit = past_candles[-1][4] # Get close of last candle
                                 
                             if opt_exit is not None:
                                 df.at[i, 'Opt Exit'] = opt_exit
