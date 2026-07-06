@@ -128,8 +128,8 @@ def process_stock(symbol, category, instrument_key):
     return None
 
 def main():
-    stocks_df = pd.read_csv('fno_with_sectors - liquid.csv')
-    ledger_file = 'master_ledger.csv'
+    stocks_df = pd.read_csv('fno_with_sectors.csv')
+    ledger_file = 'master_ledger_emax15hrd.csv'
     
     # Initialize ledger if it doesn't exist
     if not os.path.exists(ledger_file):
